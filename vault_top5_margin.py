@@ -1,7 +1,8 @@
 import os
+import json
+import requests
 import smtplib
 import ssl
-import requests
 from email.message import EmailMessage
 
 API_URL = "https://api.hyperliquid.xyz/info"
@@ -10,63 +11,100 @@ RECIPIENT_EMAIL = "latuihf@gmail.com"
 EMAIL_SUBJECT = "Top 5 Positions by Highest Margin"
 
 
-def fetch_positions():
+def api_call():
+    """Safe HL API wrapper with full debug logging."""
     payload = {
         "method": "vaultSnapshot",
-        "params": {
-            "vaultAddress": VAULT_ADDRESS
-        }
+        "params": {"vaultAddress": VAULT_ADDRESS}
     }
 
-    response = requests.post(API_URL, json=payload, timeout=20)
-    response.raise_for_status()
+    try:
+        r = requests.post(API_URL, json=payload, timeout=20)
+        if r.status_code != 200:
+            print("DEBUG: API returned non-200:", r.status_code, r.text)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("\n⚠️ API ERROR")
+        print("Exception:", e)
+        print("Raw response:", getattr(e, "response", None))
+        raise
 
-    data = response.json()
 
-    if "result" not in data:
-        raise ValueError("Invalid API response: missing result")
+def extract_positions(data):
+    """Extract vault positions safely no matter the API structure."""
+    # Multiple possible API formats:
+    # Format A: {"result": {"vault": {...}}}
+    # Format B: {"vault": {...}}
+    # Format C: {"data": {"vault": {...}}}
+    
+    vault = None
 
-    vault = data["result"].get("vault")
+    if isinstance(data, dict):
+        if "result" in data and isinstance(data["result"], dict):
+            vault = data["result"].get("vault")
+
+        if vault is None and "data" in data:
+            vault = data["data"].get("vault")
+
+        if vault is None and "vault" in data:
+            vault = data["vault"]
+
     if not vault:
-        raise ValueError("Vault missing in Hyperliquid API response")
+        print("DEBUG: Could not find vault in data:", json.dumps(data, indent=2))
+        raise ValueError("Vault structure not found in API response.")
 
-    return vault.get("positions", [])
+    pos = vault.get("positions", [])
+    if not isinstance(pos, list):
+        print("DEBUG: positions is not a list:", pos)
+        raise TypeError("Invalid positions array.")
+
+    return pos
 
 
 def safe_float(x):
     try:
-        return float(str(x).replace(",", ""))
+        return float(str(x).replace(",", "").strip())
     except:
         return 0.0
 
 
-def extract_top_positions(positions):
-    processed = []
-    for p in positions:
-        margin = safe_float(
-            p.get("positionMargin") or
-            p.get("marginUsed") or
-            0
-        )
+def get_margin(position):
+    """Auto-detect the correct margin field."""
+    for key in ["positionMargin", "marginUsed", "margin", "maintMargin"]:
+        if key in position:
+            return safe_float(position[key])
+    return 0.0
 
+
+def top5_by_margin(pos_list):
+    processed = []
+
+    for p in pos_list:
         processed.append({
             "coin": p.get("coin", "UNKNOWN"),
-            "margin": margin,
+            "margin": get_margin(p),
             "value": safe_float(p.get("positionValue", 0)),
             "size": safe_float(p.get("size", 0)),
-            "side": str(p.get("side", "")).lower()
+            "side": str(p.get("side", "unknown")).lower()
         })
 
     processed.sort(key=lambda x: x["margin"], reverse=True)
     return processed[:5]
 
 
-def build_email(top):
-    lines = ["Top 5 Positions by Margin:\n"]
-    for i, p in enumerate(top, 1):
+def build_email(toplist):
+    if not toplist:
+        return "No positions found in vault."
+
+    lines = ["Top 5 Positions by Highest Margin:\n"]
+    for i, p in enumerate(toplist, 1):
         lines.append(
-            f"{i}. {p['coin']} — Margin: {p['margin']:,.2f} — "
-            f"Value: {p['value']:,.2f} — Size: {p['size']:,.4f} — Side: {p['side']}"
+            f"{i}. {p['coin']} — "
+            f"Margin: {p['margin']:,.2f} USDC — "
+            f"Value: {p['value']:,.2f} — "
+            f"Size: {p['size']:,.4f} — "
+            f"Side: {p['side']}"
         )
     return "\n".join(lines)
 
@@ -87,104 +125,28 @@ def send_email(body):
     msg.set_content(body)
 
     ctx = ssl.create_default_context()
-    with smtplib.SMTP(host, port) as server:
-        server.starttls(context=ctx)
-        server.login(user, pwd)
-        server.send_message(msg)
+    with smtplib.SMTP(host, port) as s:
+        s.starttls(context=ctx)
+        s.login(user, pwd)
+        s.send_message(msg)
 
 
 def main():
-    positions = fetch_positions()
-    top = extract_top_positions(positions)
-    email_body = build_email(top)
-    send_email(email_body)
-    print("Top 5 margin report sent successfully.")
+    print("Fetching vault data…")
+    raw = api_call()
+
+    print("Extracting positions…")
+    positions = extract_positions(raw)
+
+    print("Sorting top 5 by margin…")
+    top5 = top5_by_margin(positions)
+
+    print("Sending email…")
+    send_email(build_email(top5))
+
+    print("✅ Email sent successfully.")
 
 
 if __name__ == "__main__":
     main()
-def to_float(value: Any) -> float:
-    if value is None:
-        return 0.0
-    try:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            cleaned = value.replace(",", "").strip()
-            return float(cleaned) if cleaned else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-    return 0.0
-
-
-def extract_top_positions(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized = []
-    for pos in positions:
-        margin_source = (
-            pos.get("positionMargin")
-            if "positionMargin" in pos
-            else pos.get("marginUsed")
-        )
-        margin = to_float(margin_source)
-        normalized.append(
-            {
-                "coin": pos.get("coin", "UNKNOWN"),
-                "margin": margin,
-                "positionValue": to_float(pos.get("positionValue")),
-                "size": to_float(pos.get("size")),
-                "side": str(pos.get("side", "n/a")).lower(),
-                "entryPx": to_float(pos.get("entryPx")),
-            }
-        )
-
-    normalized.sort(key=lambda item: item["margin"], reverse=True)
-    return normalized[:5]
-
-
-def build_email_body(top_positions: List[Dict[str, Any]]) -> str:
-    if not top_positions:
-        return "Top 5 Positions by Margin:\n(No positions available.)"
-
-    lines = ["Top 5 Positions by Margin:"]
-    for idx, pos in enumerate(top_positions, start=1):
-        lines.append(
-            f"{idx}. {pos['coin']} — Margin: {pos['margin']:,.2f} USDC — "
-            f"Value: {pos['positionValue']:,.2f} — Size: {pos['size']:,.4f} — "
-            f"Side: {pos['side']}"
-        )
-    return "\n".join(lines)
-
-
-def send_email(body: str) -> None:
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = os.getenv("SMTP_PORT")
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-
-    if not all([smtp_host, smtp_port, smtp_user, smtp_pass]):
-        raise EnvironmentError("Missing SMTP environment variables.")
-
-    message = (
-        f"Subject: {EMAIL_SUBJECT}\n"
-        f"To: {RECIPIENT_EMAIL}\n"
-        f"From: {smtp_user}\n\n"
-        f"{body}"
-    )
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
-        server.starttls(context=context)
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, RECIPIENT_EMAIL, message)
-
-
-def main() -> None:
-    positions = fetch_positions()
-    top_positions = extract_top_positions(positions)
-    email_body = build_email_body(top_positions)
-    send_email(email_body)
-    print("Top 5 margin report emailed successfully.")
-
-
-if __name__ == "__main__":
-    main()
+    
